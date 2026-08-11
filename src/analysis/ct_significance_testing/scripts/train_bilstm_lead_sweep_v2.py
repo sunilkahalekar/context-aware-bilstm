@@ -1,0 +1,359 @@
+"""
+BiLSTM Lead-Time Sweep, T+1 to T+20 min — v2 — RUN THIS IN A PYTORCH ENVIRONMENT
+====================================================================================
+Generates a genuine, model-specific answer to "how does BiLSTM's R^2 change
+with forecast lead time" -- the earlier LEAD_TIME_ACCURACY.png in this
+folder was NOT BiLSTM; it came from the pipeline's lightweight ablation-
+proxy GRU (see that figure's caption and analysis/v1/CLAUDE.md). This
+script trains the real BiLSTM architecture, six times, once per lead time,
+using the exact feature engineering and architecture from
+iaq_early_detection_gui_v3.py (lines ~980-1467) -- copied here verbatim,
+not reimplemented from memory.
+
+VERSION HISTORY -- read this before trusting either version's numbers
+  v1 (train_bilstm_lead_sweep.py), attempt 1: hidden=160, dropout=0.1.
+     Overall R^2 came back deeply negative at every lead (-9.6 at T+1 to
+     -24.0 at T+15) -- far worse than just predicting the mean.
+  v1, attempt 2: same hidden=160, but dropout raised 0.1->0.35 and AdamW
+     weight_decay raised 1e-3->3e-3, on the theory the model was
+     overfitting. Results barely moved (-10.0 at T+1, -22.9 at T+15) --
+     this ruled OUT "insufficient regularization" as the cause.
+  v2 (this file): HIDDEN dropped 160->64 instead, per the user's decision
+     to shrink model capacity rather than keep regularizing a large model.
+     64 matches the GUI pipeline's own default hidden size -- the same
+     capacity that achieved R^2=0.9979 for the real BiLSTM at lead=10 in
+     the v1 production run (see ablation_results_lead10.csv's per-model
+     table). If v2 also comes back deeply negative, the problem is not
+     model capacity either, and the next thing to check is the sequence
+     math itself (LB=15 combined with a 386-row dataset leaves very few
+     independent training sequences -- worth printing tr_s/n_test and
+     confirming they look sane before assuming another hyperparameter
+     is at fault).
+  DROPOUT and WEIGHT_DECAY are left at v1 attempt 2's raised values
+  (0.35, 3e-3) rather than reset -- flag if this combination (high
+  dropout, small model) looks like it's now UNDER-fitting instead
+  (val loss plateauing high, very early on) once you see the training log.
+
+WHY THIS COULDN'T BE RUN AUTOMATICALLY (still true for v2)
+This analysis environment has no PyTorch installed and no network access
+to install it (pip install fails on SSL certificate verification). Run
+this in the same environment that already produced BiLSTM_ck.pt for v1.
+
+Usage (in an environment with torch installed):
+    python train_bilstm_lead_sweep_v2.py --raw <sensor_data_merged_iaq_m2.csv> --outdir <analysis dir>
+"""
+
+import argparse
+import os
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+
+ALL_TGT = ["pm1", "pm2_5", "pm10", "co2", "voc"]
+MACHINES = [1, 2, 3]
+OP_ST = ["IDLE", "CUTTING", "EXPOSURE", "MAINTENANCE"]
+LEADS = [1, 3, 5, 10, 15, 20]
+
+# v2 configuration -- only HIDDEN changed from v1 attempt 2 (160 -> 64).
+# Everything else (lookback, epochs, batch, lr, early-stop patience,
+# train/val/test split) is exactly what was originally specified.
+LB = 15              # lookback (sequence length fed to the LSTM)
+EPOCHS = 500          # max training epochs (early stopping usually cuts this short)
+BATCH = 24            # batch size
+LR = 0.0003           # AdamW learning rate
+DROPOUT = 0.35        # kept at v1 attempt 2's raised value -- see version note above
+HIDDEN = 64           # SHRUNK from 160 -- matches the GUI's own default, and the
+                       # capacity that achieved R^2=0.9979 for real BiLSTM at lead=10
+N_LAYERS = 1          # single LSTM layer
+EPAT = 50             # early-stop patience (epochs with no val-loss improvement)
+TF = 0.70             # train fraction
+VF = 0.15             # val fraction (remaining 0.15 is test)
+WEIGHT_DECAY = 3e-3   # kept at v1 attempt 2's raised value
+SEED = 42
+
+
+def build_features(df):
+    """Verbatim port of v3.py's feature engineering (lines ~1006-1150),
+    assuming every feature-group checkbox is True (the config that
+    produced 68 with-Ct features for the v1 run)."""
+    for m in MACHINES:
+        col = f"M{m}_op_state"
+        for s in OP_ST:
+            df[f"M{m}_is_{s}"] = (df[col] == s).astype(float) if col in df.columns else 0.0
+
+    base_cols = (["temp", "hum", "pm1", "pm2_5", "pm10", "co2", "voc"] +
+                 [f"M{m}_f_trans" for m in MACHINES] +
+                 [f"M{m}_rho_open" for m in MACHINES] +
+                 [f"M{m}_eps_max" for m in MACHINES] +
+                 [f"M{m}_phi_open" for m in MACHINES] +
+                 [f"M{m}_emission_weight" for m in MACHINES] +
+                 [f"M{m}_effective_tau" for m in MACHINES] +
+                 [f"M{m}_consecutive_full_open" for m in MACHINES] +
+                 [f"M{m}_is_{s}" for m in MACHINES for s in OP_ST] +
+                 ["n_person", "mu_motion", "sigma2_motion"])
+    for c in base_cols:
+        if c not in df.columns:
+            df[c] = 0.0
+    df[base_cols] = df[base_cols].ffill().bfill().fillna(0.0)
+
+    door_cols_avail = [f"M{m}_phi_open" for m in MACHINES if f"M{m}_phi_open" in df.columns]
+    df["door_open_sum"] = df[door_cols_avail].sum(axis=1) if door_cols_avail else 0.0
+    # FIX 15 orientation correction (see iaq_early_detection_gui_v3.py) --
+    # keep this, it's the corrected convention used for the v1 checkpoints.
+    lo, hi = df["door_open_sum"].min(), df["door_open_sum"].max()
+    df["door_open_sum"] = hi + lo - df["door_open_sum"]
+
+    pc, mc = "n_person", "mu_motion"
+
+    df["pm1_diff1"] = df["pm1"].diff(1).bfill()
+    df["pm25_diff1"] = df["pm2_5"].diff(1).bfill()
+    df["pm10_diff1"] = df["pm10"].diff(1).bfill()
+    df["pm1_lag1"] = df["pm1"].shift(1).bfill()
+    df["pm1_lag2"] = df["pm1"].shift(2).bfill()
+    df["pm1_lag3"] = df["pm1"].shift(3).bfill()
+    df["pm25_lag1"] = df["pm2_5"].shift(1).bfill()
+    df["pm25_lag2"] = df["pm2_5"].shift(2).bfill()
+    df["pm10_lag1"] = df["pm10"].shift(1).bfill()
+    df["pm10_lag2"] = df["pm10"].shift(2).bfill()
+    df["pm_total"] = df["pm1"] + df["pm2_5"] + df["pm10"]
+    df["pm1_roll5"] = df["pm1"].rolling(5, min_periods=1).mean()
+    df["pm25_roll5"] = df["pm2_5"].rolling(5, min_periods=1).mean()
+    df["pm10_roll5"] = df["pm10"].rolling(5, min_periods=1).mean()
+    df["voc_diff1"] = df["voc"].diff(1).bfill()
+    df["voc_diff2"] = df["voc"].diff(2).bfill()
+    df["co2_lag1"] = df["co2"].shift(1).bfill()
+    df["co2_lag2"] = df["co2"].shift(2).bfill()
+    df["co2_lag3"] = df["co2"].shift(3).bfill()
+    df["co2_roll5"] = df["co2"].rolling(5, min_periods=1).mean()
+    df["person_diff"] = df[pc].diff(1).bfill()
+    df["door_diff"] = df["door_open_sum"].diff(1).bfill()
+    df["motion_roll10"] = df[mc].rolling(10, min_periods=1).mean()
+    df["door_exposure"] = (df["door_open_sum"] > 0).astype(float).rolling(10, min_periods=1).sum()
+    df["trigger_strength"] = df[pc].clip(0) * df[mc].clip(0)
+
+    feat_cols = (
+        ["temp", "hum"] + ["pm1", "pm2_5", "pm10", "co2", "voc"] +
+        ["pm1_lag1", "pm1_lag2", "pm1_lag3", "pm25_lag1", "pm25_lag2", "pm10_lag1", "pm10_lag2"] +
+        ["pm1_diff1", "pm25_diff1", "pm10_diff1", "pm_total"] +
+        ["pm1_roll5", "pm25_roll5", "pm10_roll5"] +
+        ["voc_diff1", "voc_diff2"] +
+        [pc, "person_diff"] +
+        ["door_open_sum", "door_exposure"] +
+        ["door_diff"] +
+        [mc, "motion_roll10", "trigger_strength"] +
+        ["co2_lag1", "co2_lag2", "co2_lag3", "co2_roll5"] +
+        [f"M{m}_emission_weight" for m in MACHINES] +
+        [f"M{m}_phi_open" for m in MACHINES] +
+        [f"M{m}_rho_open" for m in MACHINES] +
+        [f"M{m}_eps_max" for m in MACHINES] +
+        [f"M{m}_effective_tau" for m in MACHINES] +
+        [f"M{m}_f_trans" for m in MACHINES] +
+        [f"M{m}_consecutive_full_open" for m in MACHINES] +
+        [f"M{m}_is_{s}" for m in MACHINES for s in OP_ST]
+    )
+    seen, fc = set(), []
+    for c in feat_cols:
+        if c in df.columns and c not in seen:
+            seen.add(c); fc.append(c)
+
+    df[fc] = df[fc].ffill().bfill().fillna(0.0)
+    df[ALL_TGT] = df[ALL_TGT].clip(lower=0.0).ffill().bfill().fillna(0.0)
+    return df, fc
+
+
+class Attention(nn.Module):
+    def __init__(self, h):
+        super().__init__()
+        self.W = nn.Linear(h, 1, bias=False)
+    def forward(self, x):
+        scores = self.W(x).squeeze(-1)
+        weights = F.softmax(scores, dim=1)
+        return (x * weights.unsqueeze(-1)).sum(1)
+
+
+class BiLSTM(nn.Module):
+    """Verbatim port of iaq_early_detection_gui_v3.py's BiLSTM class."""
+    def __init__(self, in_dim, n_out):
+        super().__init__()
+        self.lstm = nn.LSTM(in_dim, HIDDEN, N_LAYERS, batch_first=True,
+                             bidirectional=True, dropout=DROPOUT if N_LAYERS > 1 else 0.0)
+        self.attn = Attention(HIDDEN * 2)
+        self.drop = nn.Dropout(DROPOUT)
+        pm_idx, gas_idx = {0, 1, 2}, {3, 4}
+        self.heads = nn.ModuleList()
+        for i in range(n_out):
+            if i in pm_idx:
+                self.heads.append(nn.Sequential(
+                    nn.Linear(HIDDEN * 2, HIDDEN), nn.ReLU(),
+                    nn.Dropout(DROPOUT * 0.5), nn.Linear(HIDDEN, 1)))
+            elif i in gas_idx:
+                self.heads.append(nn.Sequential(
+                    nn.Linear(HIDDEN * 2, HIDDEN), nn.GELU(), nn.Linear(HIDDEN, 1)))
+            else:
+                self.heads.append(nn.Linear(HIDDEN * 2, 1))
+    def forward(self, x):
+        o, _ = self.lstm(x)
+        ctx = self.drop(self.attn(o))
+        return torch.cat([hd(ctx) for hd in self.heads], 1)
+
+
+class DS(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+    def __len__(self): return len(self.X)
+    def __getitem__(self, i): return self.X[i], self.y[i]
+
+
+def make_seqs(Xs, ys, lb, lead):
+    Xo, yo = [], []
+    for i in range(len(Xs) - lb - lead + 1):
+        Xo.append(Xs[i:i + lb])
+        yo.append(ys[i + lb + lead - 1])
+    return np.array(Xo, dtype=np.float32), np.array(yo, dtype=np.float32)
+
+
+def r2_score(actual, pred):
+    ss_res = np.sum((actual - pred) ** 2, axis=0)
+    ss_tot = np.sum((actual - actual.mean(axis=0)) ** 2, axis=0)
+    return 1 - ss_res / np.clip(ss_tot, 1e-9, None)
+
+
+def train_one_lead(df_raw, feat_cols, lead, device):
+    df = df_raw.copy()
+    n = len(df)
+    tr_end, va_end = int(n * TF), int(n * (TF + VF))
+
+    X_raw = df[feat_cols].values.astype(np.float32)
+    y_raw = df[ALL_TGT].values.astype(np.float32)
+
+    x_sc = StandardScaler(); x_sc.fit(X_raw[:tr_end])
+    Xsc = x_sc.transform(X_raw).astype(np.float32)
+
+    y_sc_dict, y_sc_cols = {}, []
+    for i, t in enumerate(ALL_TGT):
+        sc = StandardScaler(); sc.fit(y_raw[:tr_end, i].reshape(-1, 1))
+        y_sc_dict[t] = sc
+        y_sc_cols.append(sc.transform(y_raw[:, i].reshape(-1, 1)))
+    y_sc = np.hstack(y_sc_cols).astype(np.float32)
+    in_dim, n_out = Xsc.shape[1], len(ALL_TGT)
+
+    X_seq, y_seq = make_seqs(Xsc, y_sc, LB, lead)
+    tr_s = max(0, tr_end - LB - lead + 1)
+    va_s = max(tr_s, va_end - LB - lead + 1)
+    if tr_s < 10:
+        raise RuntimeError(f"Too few training sequences at lead={lead}")
+
+    tr_ld = DataLoader(DS(X_seq[:tr_s], y_seq[:tr_s]), BATCH, shuffle=True)
+    va_ld = DataLoader(DS(X_seq[tr_s:va_s], y_seq[tr_s:va_s]), BATCH, shuffle=False)
+    te_X, te_y_sc = X_seq[va_s:], y_seq[va_s:]
+    te_y_actual = y_raw[[min(i + LB + lead - 1, n - 1) for i in range(va_s, len(X_seq))]]
+
+    torch.manual_seed(SEED); np.random.seed(SEED)
+    model = BiLSTM(in_dim, n_out).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    sch = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=30, T_mult=2)
+    w_t = torch.tensor([1.0, 1.0, 1.0, 2.0, 2.0], device=device)  # fixed loss weights default
+    best, pat, best_state = float("inf"), 0, None
+    for ep in range(1, EPOCHS + 1):
+        model.train()
+        for xb, yb in tr_ld:
+            opt.zero_grad()
+            pr = model(xb.to(device)); yt = yb.to(device)
+            loss = ((pr - yt) ** 2 * w_t).mean()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+        sch.step()
+        model.eval()
+        with torch.no_grad():
+            vl = float(np.mean([nn.MSELoss()(model(xb.to(device)), yb.to(device)).item() for xb, yb in va_ld]))
+        if vl < best - 1e-6:
+            best, pat, best_state = vl, 0, {k: v.clone() for k, v in model.state_dict().items()}
+        else:
+            pat += 1
+        if pat >= EPAT:
+            break
+        if ep % 50 == 0 or ep == 1:
+            print(f"    ep{ep:>4}  val={vl:.5f}  best={best:.5f}")
+    model.load_state_dict(best_state)
+
+    model.eval()
+    with torch.no_grad():
+        pred_sc = model(torch.tensor(te_X, dtype=torch.float32).to(device)).cpu().numpy()
+    pred = np.zeros_like(pred_sc)
+    for i, t in enumerate(ALL_TGT):
+        pred[:, i] = y_sc_dict[t].inverse_transform(pred_sc[:, i].reshape(-1, 1)).ravel()
+
+    r2_per = r2_score(te_y_actual, pred)
+    rmse_per = np.sqrt(np.mean((te_y_actual - pred) ** 2, axis=0))
+    row = {"lead_min": lead, "n_train": tr_s, "n_test": len(te_y_actual),
+           "overall_R2": float(np.mean(r2_per)), "overall_RMSE": float(np.mean(rmse_per))}
+    for i, t in enumerate(ALL_TGT):
+        row[f"{t}_R2"] = float(r2_per[i]); row[f"{t}_RMSE"] = float(rmse_per[i])
+
+    # origin_idx = index of the LAST row in each sequence's lookback window --
+    # the forecast-issue "now" -- matching persistence_baseline_sweep.py's
+    # convention (target row = origin_idx + lead) so the two can be compared
+    # or resampled at exactly the same test-window points.
+    origin_idx = [i + LB - 1 for i in range(va_s, len(X_seq))]
+    pred_rows = []
+    for i, t in enumerate(ALL_TGT):
+        for oi, a, p in zip(origin_idx, te_y_actual[:, i], pred[:, i]):
+            pred_rows.append({"lead_min": lead, "target": t, "origin_idx": oi,
+                               "actual": float(a), "predicted": float(p)})
+    return row, pred_rows
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--raw", required=True)
+    ap.add_argument("--outdir", default=".")
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--export-predictions", action="store_true",
+                     help="Also save per-origin actual/predicted values to "
+                          "bilstm_predictions_export.csv, in the [lead_min,target,"
+                          "origin_idx,actual,predicted] schema lead_time_effective_"
+                          "horizon.py's --model-predictions expects.")
+    args = ap.parse_args()
+    device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) else
+                           ("cpu" if args.device == "auto" else args.device))
+    print(f"Device: {device}  |  v2 config: hidden={HIDDEN} dropout={DROPOUT} weight_decay={WEIGHT_DECAY}")
+
+    df = pd.read_csv(args.raw)
+    df["timestamp_minute"] = pd.to_datetime(df["timestamp_minute"], format="%m-%d-%Y %H:%M")
+    df = df.sort_values("timestamp_minute").reset_index(drop=True)
+    df, feat_cols = build_features(df)
+    print(f"Feature set: {len(feat_cols)} columns (should be 68, matching the v1 with-Ct run)")
+
+    rows, all_pred_rows = [], []
+    for lead in LEADS:
+        print(f"\n=== Training BiLSTM, lead={lead}min ===")
+        row, pred_rows = train_one_lead(df, feat_cols, lead, device)
+        print(f"  overall_R2={row['overall_R2']:.4f}  overall_RMSE={row['overall_RMSE']:.3f}  "
+              f"n_train={row['n_train']}  n_test={row['n_test']}")
+        rows.append(row)
+        all_pred_rows.extend(pred_rows)
+
+    out = pd.DataFrame(rows)
+    out_csv = os.path.join(args.outdir, "bilstm_lead_time_sweep_v2.csv")
+    out.round(4).to_csv(out_csv, index=False)
+    print(f"\nSaved: {out_csv}")
+    print("Feed this into lead_time_accuracy.py (it auto-detects 'bilstm' in the filename")
+    print("for the chart label/subtitle -- pass --model-label 'BiLSTM v2' if you want that distinction visible).")
+
+    if args.export_predictions:
+        pred_csv = os.path.join(args.outdir, "bilstm_predictions_export.csv")
+        pd.DataFrame(all_pred_rows).round(4).to_csv(pred_csv, index=False)
+        print(f"Saved: {pred_csv}")
+        print("Feed this into lead_time_effective_horizon.py --model-predictions to get the real")
+        print("model-vs-persistence gap-with-confidence-band plot.")
+
+
+if __name__ == "__main__":
+    main()

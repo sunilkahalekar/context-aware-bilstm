@@ -1,0 +1,8 @@
+model,with_Ct,without_Ct,pct_change_without_ct
+BiLSTM,32.09,118.12,268.06
+Seq2Seq,68.68,119.62,74.16
+GRU,73.03,110.51,51.33
+LSTM_uni,84.0,112.91,34.43
+VanillaRNN,114.54,140.69,22.83
+CNN_LSTM,189.95,176.01,-7.34
+BiGRU,114.53,106.09,-7.37

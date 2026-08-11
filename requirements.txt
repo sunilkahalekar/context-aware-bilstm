@@ -1,0 +1,25 @@
+# Vision stage (src/vision/)
+opencv-python
+supervision
+ultralytics
+pyyaml
+
+# Modeling stage (src/modeling/) — torch install is platform/CUDA-specific;
+# see src/modeling/README.md Sec 3 before running `pip install -r` blindly.
+# For CUDA 12.1:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# CPU-only:
+#   pip install torch torchvision torchaudio
+torch
+torchvision
+torchaudio
+scikit-learn
+xgboost
+
+# Shared across modeling + analysis
+numpy
+pandas
+matplotlib
+seaborn
+scipy
+statsmodels

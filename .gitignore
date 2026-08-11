@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Model checkpoints (large binary, not needed to reproduce analysis)
+*.pt
+*.onnx
+*.engine
+
+# Video / large media (never commit raw footage)
+*.mp4
+*.avi
+*.3gp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
