@@ -184,7 +184,7 @@ The system expects **one merged CSV file** containing all sensor readings at **1
 | `M1_emission_weight` | float | Machine 1 emission weighting factor — ⚠️ not currently produced by the upstream vision pipeline, see [§21](#21-known-gap-incomplete-vision-side-ct-features) |
 | `M2_emission_weight` | float | Machine 2 emission weighting factor — ⚠️ same gap |
 | `M3_emission_weight` | float | Machine 3 emission weighting factor — ⚠️ same gap |
-| `M1_effective_tau` | float | Machine 1 effective exposure time — ⚠️ same gap |
+| `M1_effective_tau` | float | Machine 1 effective exposure time — real, produced by the data-pipeline merge stage's `enrich_operational_state()`, NOT dead (corrected — see [§21](#21-known-gap-incomplete-vision-side-ct-features)). Statefully computed, though; not derivable from a short live window, see §21. |
 | `M1_consecutive_full_open` | int | Consecutive minutes M1 door has been fully open — ⚠️ same gap |
 | `M1_is_IDLE` | int (0/1) | Machine 1 operational state one-hot — ⚠️ same gap |
 | `M1_is_CUT` | int (0/1) | Machine 1 in cutting operation — ⚠️ same gap |
@@ -1240,38 +1240,73 @@ treating results built on this as final.
 
 ## 21. Known Gap: Incomplete Vision-Side C_t Features
 
-Eighteen of the 68 with-C_t feature columns are currently **constant
-zero** in every run to date: `M{1,2,3}_emission_weight`,
-`M{1,2,3}_effective_tau`, `M{1,2,3}_consecutive_full_open`, and the 12
-`M{1,2,3}_is_{IDLE,CUTTING,EXPOSURE,MAINTENANCE}` operational-state
-one-hots. This is not a bug in this repo — `base_cols` silently defaults
-any of these to `0.0` when absent from the input CSV (by design, so the
-GUI degrades gracefully on partial data) rather than erroring, which is
-exactly why this went unnoticed until it was traced end-to-end.
+**Correction (verified against the real v1 training CSV during the
+edge-deployment work in `context-aware-bilstm-edge` — see that repo's
+`feature_engineering.py`):** this section previously grouped
+`M{1,2,3}_effective_tau` in with the three genuinely dead feature groups.
+That was wrong. Checked directly against `data/raw/sensor_data_merged_iaq_m2.csv`:
+`M{1,2,3}_effective_tau` is **present with real, varying values** (28-34
+unique values per machine, range 0-57) — it is NOT constant zero. The
+three that actually are constant zero — confirmed the same way — are
+`M{1,2,3}_emission_weight` (3), `M{1,2,3}_consecutive_full_open` (3), and
+the 12 `M{1,2,3}_is_{IDLE,CUTTING,EXPOSURE,MAINTENANCE}` one-hots (12).
+3+3+12 = **18**, which is where that figure actually comes from — not
+3+3+3+12=21 as the original wording implied by including `effective_tau`.
+`base_cols` silently defaults any of the four groups to `0.0` when absent
+from the input CSV (by design, so the GUI degrades gracefully on partial
+data) rather than erroring, which is exactly why this went unnoticed
+until it was traced end-to-end against real data instead of assumed from
+the code's structure.
 
-**The actual root cause is upstream**, in
+**Where `effective_tau` actually comes from, and why it's excluded from
+the edge-deployed model anyway:**
+[`../data_pipeline/merge_vision_and_sensor_data.py`](../data_pipeline/README.md)'s
+`enrich_operational_state()` computes it (`effective_tau = tau_open ×
+emission_weight`, with `emission_weight` looked up from an
+`_classify_state()` call that itself depends on `consecutive_full_open` —
+see that file's own CLAUDE.md). It's a **stateful, order-dependent
+running counter over the entire history** ("`consecutive_full_open` does
+not reset across a gap"), computed row-by-row from the start of the
+dataset — not a windowed feature. `sensor_data_merged_iaq_m2.csv` retains
+the resulting `effective_tau` column but not the intermediate
+`emission_weight`/`op_state`/`consecutive_full_open` columns it was
+computed from (this CSV predates, or was exported without,
+`enrich_operational_state()`'s full output — see that module's own
+docstring history). This statefulness is why `context-aware-bilstm-edge`
+deliberately excludes `effective_tau` from the model actually deployed to
+the Pi: reproducing it in live inference would require porting
+`enrich_operational_state()`'s exact row-by-row classifier to run
+continuously on the device, not just a training-config change. See
+`context-aware-bilstm-edge/feature_engineering.py`'s docstring for the
+full reasoning and the `use_effective_tau` / `use_emission_weight` toggle
+split that resulted from this.
+
+**The actual root cause of the 18 dead columns is upstream**, in
 [`../vision/extract_context_vector_from_video.py`](../vision/README.md):
 `compute_Dt()` — the function that turns YOLO door detections into the D_t
 feature vector — only ever computes
 `tau_open`, `f_trans`, `rho_open`, `eps_max`, `phi_open`. It has no
-`emission_weight`, `effective_tau`, `consecutive_full_open`, or per-machine
-operational-state (`IDLE`/`CUTTING`/`EXPOSURE`/`MAINTENANCE`) logic at all.
-`M{n}_op_state` — the column this repo's op-state one-hot block reads —
-isn't produced anywhere upstream either.
+`emission_weight`, `consecutive_full_open`, or per-machine
+operational-state (`IDLE`/`CUTTING`/`EXPOSURE`/`MAINTENANCE`) logic at all
+(that logic lives one stage downstream, in `enrich_operational_state()` —
+see above). `M{n}_op_state` — the column this repo's op-state one-hot
+block reads — isn't produced by `compute_Dt()` either, for the same
+reason; `iaq-edge-pipeline`'s own `compute_Dt()` (used live on the Pi) has
+the identical, deliberately-matching set of outputs.
 
 **This does not invalidate the with/without-C_t comparisons in §19** —
 those 18 columns are zero in both configurations, so they contribute
-nothing to either side of the comparison. It does mean the *true*
-informative C_t feature count is smaller than "68" suggests, and that
-`emission_weight`/`effective_tau`/`consecutive_full_open`/op-state are
-currently untested hypotheses about what should predict pollutant behavior,
-not features that have actually been evaluated. Two ways forward, not
-mutually exclusive:
-1. **Implement them upstream** in `compute_Dt()` if the underlying
-   physical quantities are well-defined (e.g. `effective_tau` sounds like
-   it should be some exposure-time-weighted decay constant, but the exact
-   formula needs to come from whoever owns the emission model — this repo
-   should not guess at physics it can't verify).
+nothing to either side of the comparison; `effective_tau` (real, not
+dead) IS meaningfully present in the with-C_t configuration and absent
+from without-C_t, so it does contribute to that comparison, correctly.
+Two ways forward for the 18 genuinely dead columns, not mutually
+exclusive:
+1. **Implement `emission_weight`/`op_state`/`consecutive_full_open`
+   upstream** in `compute_Dt()` if you want them in a *research* model
+   (they're already computed downstream by `enrich_operational_state()`
+   for `effective_tau`'s sake — extending `compute_Dt()` itself would
+   mean duplicating or relocating that logic, a real design decision, not
+   a quick fix).
 2. **At minimum, strip them from `feat_cols`** until they're real, so the
    68-column feature count in the manuscript matches what's actually being
    tested — reporting "68 features" when 18 are provably inert overstates

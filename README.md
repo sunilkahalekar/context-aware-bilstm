@@ -57,15 +57,21 @@ M{n}_eps_max, M{n}_phi_open, n_person, mu_motion, sigma2_motion`. **Full
 detail**: [`src/vision/README.md`](src/vision/README.md) (Part 2).
 
 > **Known gap**: the modeling stage's feature list also expects
-> `M{n}_emission_weight`, `M{n}_effective_tau`, `M{n}_consecutive_full_open`,
-> and per-machine operational-state one-hots. `compute_Dt()` here **does not
-> compute any of these** — they were never implemented at this stage, not
-> lost in the merge. The modeling GUI silently defaults them to 0.0 when
-> absent rather than erroring, so every run to date has trained on 18 of 68
-> "with-C_t" columns that are constant zero. This is a real, fixable
-> extension to `compute_Dt()`, not a bug to work around downstream — see
-> [`src/modeling/README.md`](src/modeling/README.md) §21 for the full
-> explanation and its (currently negligible) practical impact.
+> `M{n}_emission_weight`, `M{n}_consecutive_full_open`, and per-machine
+> operational-state one-hots. `compute_Dt()` here **does not compute any of
+> these** — they were never implemented at this stage. The modeling GUI
+> silently defaults them to 0.0 when absent rather than erroring, so every
+> run to date has trained on 18 of 68 "with-C_t" columns that are constant
+> zero. (`M{n}_effective_tau` is a fourth column that looks related but is
+> **not** part of this gap — it's computed one stage downstream, in
+> `src/data_pipeline/merge_vision_and_sensor_data.py`'s
+> `enrich_operational_state()`, and is real/non-zero in the checked-in
+> training data; verified directly against `data/raw/sensor_data_merged_iaq_m2.csv`
+> while building `context-aware-bilstm-edge`. An earlier version of this
+> note incorrectly grouped it with the dead columns.) This is a real,
+> fixable extension to `compute_Dt()`, not a bug to work around downstream
+> — see [`src/modeling/README.md`](src/modeling/README.md) §21 for the
+> full explanation.
 
 ### Stage 5 — Merge with pollutant data
 Joins the vision pipeline's `Ct_vectors_<tag>.csv` against the per-minute
@@ -130,6 +136,63 @@ standing instruction on this — it was added after an explicit back-and-forth
 about not overstating this result, and it governs every downstream document
 in this repo.
 
+## Edge deployment — how this connects to two other repos
+
+This repo answers the research question (does C_t help, and does BiLSTM
+specifically hold up). Two companion repos take the validated BiLSTM to a
+Raspberry Pi 4 for live inference:
+
+```mermaid
+flowchart LR
+    subgraph R1["context-aware-bilstm (this repo)"]
+        direction TB
+        DATA["data/raw/sensor_data_merged_iaq_m2.csv"] --> FE["src/modeling/<br/>feature_engineering.py + models.py"]
+    end
+
+    subgraph R2["context-aware-bilstm-edge"]
+        direction TB
+        TRAIN["train_bilstm.py<br/>(CLI, CSV in, dev machine)"] --> ONNX["export_onnx.py<br/>-> model.onnx + bundle"]
+    end
+
+    subgraph R3["iaq-edge-pipeline (Raspberry Pi 4)"]
+        direction TB
+        CAM["Camera + YOLO"] --> CTV[("ct_vectors")]
+        SENS["PMS5003/MH-Z19B/<br/>SGP40/DHT22"] --> SR[("sensor_readings")]
+        CTV --> FC["iaq_forecast.py"]
+        SR --> FC
+        FC --> FT[("forecasts")]
+    end
+
+    FE -.vendored copy.-> TRAIN
+    ONNX -.copy model.onnx + bundle to Pi.-> FC
+    FE -.vendored copy.-> FC
+
+    style R1 fill:#1a2332,stroke:#4a90d9
+    style R2 fill:#1a2e1a,stroke:#4ad94a
+    style R3 fill:#2e1a1a,stroke:#d94a4a
+```
+
+**Full walkthrough, setup, and honest verification status**:
+[`context-aware-bilstm-edge/README.md`](https://github.com/sunilkahalekar/context-aware-bilstm-edge)
+and [`iaq-edge-pipeline/README.md`](https://github.com/sunilkahalekar/iaq-edge-pipeline).
+
+**Two things the edge work found by testing this repo's code against real
+data, not just reading it** (both are corrected in §21 below and in the
+edge repo's own docs — worth knowing if you're extending this repo
+further):
+1. `feature_engineering.py`'s extraction from
+   `train_context_aware_bilstm_gui.py` never persisted the fitted
+   `StandardScaler`/`MinMaxScaler` objects anywhere — a checkpoint alone
+   was never actually enough to reproduce correct predictions. Fixed by
+   `feature_engineering.save_bundle()`/`load_bundle()`.
+2. FIX 15's door-orientation reversal (`hi + lo - value`) recomputes its
+   bounds from whatever dataframe is passed in — correct for a training
+   run using the full dataset, but silently wrong if ever run against a
+   small live window (proven on real data: a 30-row tail slice gave
+   bounds `[3.0, 3.0]` instead of the correct `[0.0, 3.0]`). Fixed by
+   persisting the training-time bounds in the preprocessing bundle and
+   requiring inference to reuse them.
+
 ## Repository layout
 
 ```
@@ -177,6 +240,8 @@ each `src/*/README.md` has its own runnable quick-start.
 - **18 of 68 "with-C_t" features are constant zero** (see Stage 4's "Known
   gap" above) — doesn't invalidate the with/without-C_t comparisons, but
   means the true informative feature count is smaller than 68.
+  `M{n}_effective_tau` is NOT one of the 18 (corrected — it's real, just
+  computed downstream and stateful; see `src/modeling/README.md` §21).
 - **The door-orientation fix (FIX 15) is tentative** — inferred from the
   manuscript's own description of `phi_open` plus an empirical
   anti-correlation check, not confirmed against a real per-machine door

@@ -163,6 +163,9 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import feature_engineering as fe
+
 warnings.filterwarnings("ignore")
 
 MISSING = []
@@ -1003,28 +1006,6 @@ class EarlyDetectionApp(tk.Tk):
             emit(f"  ⚠  '{ts_col}' not found — using row index")
             df[ts_col] = pd.date_range("2024-01-01", periods=len(df), freq="1min")
 
-        # op-state one-hot
-        for m in MACHINES:
-            col = f"M{m}_op_state"
-            for s in OP_ST:
-                df[f"M{m}_is_{s}"] = (
-                    (df[col] == s).astype(float)
-                    if col in df.columns else 0.0)
-
-        base_cols = (["temp","hum","pm1","pm2_5","pm10","co2","voc"] +
-                     [f"M{m}_f_trans"  for m in MACHINES] +
-                     [f"M{m}_rho_open" for m in MACHINES] +
-                     [f"M{m}_eps_max"  for m in MACHINES] +
-                     [f"M{m}_phi_open" for m in MACHINES] +
-                     [f"M{m}_emission_weight"      for m in MACHINES] +
-                     [f"M{m}_effective_tau"         for m in MACHINES] +
-                     [f"M{m}_consecutive_full_open" for m in MACHINES] +
-                     [f"M{m}_is_{s}" for m in MACHINES for s in OP_ST] +
-                     ["n_person","mu_motion","sigma2_motion"])
-        for c in base_cols:
-            if c not in df.columns: df[c] = 0.0
-        df[base_cols] = df[base_cols].ffill().bfill().fillna(0.0)
-
         n      = len(df)
         tr_end = int(n * TF)
         va_end = int(n * (TF + VF))
@@ -1033,132 +1014,25 @@ class EarlyDetectionApp(tk.Tk):
             emit("  ✗ Too few rows (<100). Aborting.")
             self.after(0, lambda: self._finish(False)); return
 
-        # ── FEATURE ENGINEERING ────────────────────────────────────────────────
+        # ── FEATURE ENGINEERING (delegated to feature_engineering.py) ─────────
+        # See that module's docstring for why this used to be inline and why
+        # it was pulled out: reproducing this exact preprocessing at edge
+        # inference time (iaq-edge-pipeline) requires a GUI/torch-free
+        # importable version of it, and it now also persists the fitted
+        # scalers, which the old inline version never did.
         emit("\n  Building features…")
         feat_cfg = cfg["features"]
 
-        # door signal
-        door_cols_avail = [f"M{m}_phi_open" for m in MACHINES
-                           if f"M{m}_phi_open" in df.columns]
-        user_door = cfg.get("door_col","")
-        if user_door and user_door in df.columns:
-            df["door_open_sum"] = df[user_door]
-        else:
-            df["door_open_sum"] = df[door_cols_avail].sum(axis=1) if door_cols_avail else 0.0
-
-        # FIX 15 (tentative — see FIX 14): phi_open reads LOW while a door
-        # is actively/freshly opening and HIGH once it has settled back to
-        # idle, the opposite of "amount of door openness" every downstream
-        # consumer assumes. FIX 14 patched only the chart's display value;
-        # this instead reverses door_open_sum once, at the source, right
-        # after it's built, so every consumer inherits the corrected
-        # orientation consistently: door_diff, door_exposure, and the
-        # door_open_sum feature itself (all computed below from this same
-        # column), the onset/trigger rising-edge detector in
-        # _build_regime_labels/_get_trigger_timestamps (door_rise now
-        # correctly fires when a door is opening, not settling), and the
-        # causality cross-correlation against each pollutant. Because the
-        # value is now correct at the source, _get_ctx_for_widx's FIX-14
-        # display flip has been reverted below (undoing it there — flipping
-        # twice would silently restore the original, wrong orientation).
-        # Marked tentative: this assumes the FIX-14 hypothesis about
-        # phi_open's convention is correct. Verify against a ground-truth
-        # per-machine door sensor before citing results built on this.
-        if "door_open_sum" in df.columns:
-            _door_lo0 = float(df["door_open_sum"].min())
-            _door_hi0 = float(df["door_open_sum"].max())
-            df["door_open_sum"] = _door_hi0 + _door_lo0 - df["door_open_sum"]
-
-        pc = cfg["person_col"] if cfg["person_col"] in df.columns else "n_person"
-        mc = cfg["motion_col"] if cfg["motion_col"] in df.columns else "mu_motion"
-
-        # ── FIX 5: PM momentum features (always computed, selectively added) ──
-        df["pm1_diff1"]   = df["pm1"].diff(1).bfill()
-        df["pm25_diff1"]  = df["pm2_5"].diff(1).bfill()
-        df["pm10_diff1"]  = df["pm10"].diff(1).bfill()
-        df["pm1_lag1"]    = df["pm1"].shift(1).bfill()
-        df["pm1_lag2"]    = df["pm1"].shift(2).bfill()
-        df["pm1_lag3"]    = df["pm1"].shift(3).bfill()
-        df["pm25_lag1"]   = df["pm2_5"].shift(1).bfill()
-        df["pm25_lag2"]   = df["pm2_5"].shift(2).bfill()
-        df["pm10_lag1"]   = df["pm10"].shift(1).bfill()
-        df["pm10_lag2"]   = df["pm10"].shift(2).bfill()
-        df["pm_total"]    = df["pm1"] + df["pm2_5"] + df["pm10"]
-        df["pm1_roll5"]   = df["pm1"].rolling(5,  min_periods=1).mean()
-        df["pm25_roll5"]  = df["pm2_5"].rolling(5, min_periods=1).mean()
-        df["pm10_roll5"]  = df["pm10"].rolling(5, min_periods=1).mean()
-
-        # VOC + CO2 momentum
-        df["voc_diff1"]   = df["voc"].diff(1).bfill()
-        df["voc_diff2"]   = df["voc"].diff(2).bfill()
-        df["co2_lag1"]    = df["co2"].shift(1).bfill()
-        df["co2_lag2"]    = df["co2"].shift(2).bfill()
-        df["co2_lag3"]    = df["co2"].shift(3).bfill()
-        df["co2_roll5"]   = df["co2"].rolling(5, min_periods=1).mean()
-
-        # Trigger / door / motion
-        df["person_diff"]   = df[pc].diff(1).bfill()
-        df["door_diff"]     = df["door_open_sum"].diff(1).bfill()
-        df["motion_roll10"] = df[mc].rolling(10, min_periods=1).mean()
-        df["door_exposure"] = (df["door_open_sum"]>0).astype(float)\
-                               .rolling(10,min_periods=1).sum()
-        df["trigger_strength"] = df[pc].clip(0) * df[mc].clip(0)
-
+        df, feat_cols, pc, mc, door_lo, door_hi = fe.build_features_for_training(
+            df, feat_cfg,
+            person_col_cfg=cfg.get("person_col"),
+            motion_col_cfg=cfg.get("motion_col"),
+            door_col_cfg=cfg.get("door_col"),
+            machines=MACHINES, op_states=OP_ST,
+        )
+        df[ALL_TGT] = df[ALL_TGT].clip(lower=0.0).ffill().bfill().fillna(0.0)
         emit("  FIX 1: PM lags, diffs, rolling means computed")
         emit("  FIX 5: Trigger features (door/person/motion) computed")
-
-        # ── SELECT FEATURES ────────────────────────────────────────────────────
-        feat_cols = []
-        if feat_cfg.get("use_env"):
-            feat_cols += ["temp","hum"]
-        if feat_cfg.get("use_raw_sensors"):
-            feat_cols += ["pm1","pm2_5","pm10","co2","voc"]
-        # FIX 1: PM features — always include when checkbox is on
-        if feat_cfg.get("use_pm_lags"):
-            feat_cols += ["pm1_lag1","pm1_lag2","pm1_lag3",
-                          "pm25_lag1","pm25_lag2",
-                          "pm10_lag1","pm10_lag2"]
-        if feat_cfg.get("use_pm_diff"):
-            feat_cols += ["pm1_diff1","pm25_diff1","pm10_diff1","pm_total"]
-        if feat_cfg.get("use_pm_roll"):
-            feat_cols += ["pm1_roll5","pm25_roll5","pm10_roll5"]
-        if feat_cfg.get("use_voc_diff"):
-            feat_cols += ["voc_diff1","voc_diff2"]
-        if feat_cfg.get("use_person_diff"):
-            feat_cols += [pc, "person_diff"]
-        if feat_cfg.get("use_door_sum"):
-            feat_cols += ["door_open_sum","door_exposure"]
-        if feat_cfg.get("use_door_diff"):
-            feat_cols += ["door_diff"]
-        if feat_cfg.get("use_motion_roll"):
-            feat_cols += [mc,"motion_roll10","trigger_strength"]
-        if feat_cfg.get("use_co2_lags"):
-            feat_cols += ["co2_lag1","co2_lag2","co2_lag3","co2_roll5"]
-        if feat_cfg.get("use_emission_wt"):
-            # FIX 12: all five Dt descriptors (phi_open, rho_open, eps_max,
-            # effective_tau, f_trans), plus the derived emission_weight —
-            # previously only phi_open + emission_weight were included.
-            feat_cols += [f"M{m}_emission_weight" for m in MACHINES] + \
-                         [f"M{m}_phi_open"        for m in MACHINES] + \
-                         [f"M{m}_rho_open"        for m in MACHINES] + \
-                         [f"M{m}_eps_max"         for m in MACHINES] + \
-                         [f"M{m}_effective_tau"   for m in MACHINES] + \
-                         [f"M{m}_f_trans"         for m in MACHINES]
-        if feat_cfg.get("use_consecutive"):
-            feat_cols += [f"M{m}_consecutive_full_open" for m in MACHINES]
-        if feat_cfg.get("use_op_state_onehot"):
-            feat_cols += [f"M{m}_is_{s}" for m in MACHINES for s in OP_ST]
-
-        # deduplicate
-        seen = set(); fc = []
-        for c in feat_cols:
-            if c in df.columns and c not in seen:
-                seen.add(c); fc.append(c)
-        feat_cols = fc or ["pm1_lag1","pm25_lag1","voc_diff1",
-                           "door_open_sum","person_diff","motion_roll10"]
-
-        df[feat_cols] = df[feat_cols].ffill().bfill().fillna(0.0)
-        df[ALL_TGT]   = df[ALL_TGT].clip(lower=0.0).ffill().bfill().fillna(0.0)
         emit(f"\n  Feature set ({len(feat_cols)} cols): {feat_cols}")
 
         # ── FIX 4: Scale fit on TRAIN only ────────────────────────────────────
@@ -1166,19 +1040,21 @@ class EarlyDetectionApp(tk.Tk):
         X_raw = df[feat_cols].values.astype(np.float32)
         y_raw = df[ALL_TGT].values.astype(np.float32)
 
-        x_sc  = StandardScaler()                        # FIX 6: StandardScaler
-        x_sc.fit(X_raw[:tr_end])
-        Xsc   = x_sc.transform(X_raw).astype(np.float32)
-
-        y_sc_dict = {}
-        y_sc_cols = []
-        for i, t in enumerate(ALL_TGT):
-            sc = MinMaxScaler()
-            sc.fit(y_raw[:tr_end, i].reshape(-1,1))    # train only
-            y_sc_dict[t] = sc
-            y_sc_cols.append(sc.transform(y_raw[:,i].reshape(-1,1)))
-        y_sc   = np.hstack(y_sc_cols).astype(np.float32)
+        x_sc, y_sc_dict = fe.fit_scalers(X_raw, y_raw, tr_end, all_targets=ALL_TGT)
+        Xsc, y_sc = fe.apply_scalers(X_raw, y_raw, x_sc, y_sc_dict, all_targets=ALL_TGT)
         in_dim = Xsc.shape[1]
+
+        # Persist the exact preprocessing state used for this run so a saved
+        # checkpoint is actually usable for inference later — previously
+        # scalers were fit in memory and never written to disk anywhere.
+        fe.save_bundle(
+            os.path.join(out, "preprocessing_bundle"),
+            x_sc, y_sc_dict, feat_cols, feat_cfg, LB, LEAD,
+            door_lo, door_hi,
+            person_col=pc, motion_col=mc, door_col=cfg.get("door_col"),
+            all_targets=ALL_TGT, machines=MACHINES, op_states=OP_ST,
+        )
+        emit(f"  Saved preprocessing bundle -> {out}/preprocessing_bundle/")
 
         # ── FIX 3: ADAPTIVE LOSS WEIGHTS ──────────────────────────────────────
         if cfg["adaptive_loss"]:
@@ -1195,14 +1071,7 @@ class EarlyDetectionApp(tk.Tk):
         # ── SEQUENCES ─────────────────────────────────────────────────────────
         emit(f"\n  Sequence: X[t…t+{LB}] → y[t+{LB+LEAD-1}]  (Lead={LEAD}min)")
 
-        def make_seqs(Xs, ys):
-            Xo, yo = [], []
-            for i in range(len(Xs) - LB - LEAD + 1):
-                Xo.append(Xs[i:i+LB])
-                yo.append(ys[i+LB+LEAD-1])
-            return np.array(Xo,dtype=np.float32), np.array(yo,dtype=np.float32)
-
-        X_seq, y_seq = make_seqs(Xsc, y_sc)
+        X_seq, y_seq = fe.make_sequences(Xsc, y_sc, LB, LEAD)
         tr_s = max(0, tr_end - LB - LEAD + 1)
         va_s = max(tr_s, va_end - LB - LEAD + 1)
         emit(f"  Sequences: total={len(X_seq)}  train={tr_s}  val={va_s-tr_s}")
